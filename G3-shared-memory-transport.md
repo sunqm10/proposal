@@ -4,7 +4,7 @@ G3: Shared Memory Transport for gRPC
 * Approver: a11r
 * Status: Draft
 * Implemented in: n/a
-* Last updated: 2026-03-26
+* Last updated: 2026-04-10
 * Discussion at: (TBD)
 
 ## Abstract
@@ -235,6 +235,9 @@ the stream's flow-control window.
 Chunks for a single message MUST appear consecutively on the stream. No
 other frames for the same StreamID (including WINDOW_UPDATE or HALF_CLOSE)
 may be interleaved between the first chunk and the final (non-MORE) chunk.
+Messages larger than the ring capacity are supported through chunking.
+The maximum message size is bounded by the 4-byte Message-Length field in
+the gRPC Length-Prefixed-Message encoding (~4 GB).
 
 #### PING
 
@@ -318,13 +321,54 @@ MetadataCount(2B LE) | [Key-Value pairs]*
 - StatusMsg: human-readable status message; MAY be empty (MsgLen = 0).
 - Key-value encoding is identical to the Headers payload.
 
+## Transport Discovery
+
+Before using shared memory, the client and server exchange transport
+capabilities over an existing HTTP/2 connection. Discovery uses gRPC
+metadata on any RPC:
+
+1. The client sends initial metadata key `shm-offer` with an empty value.
+2. If the server supports shared memory and the connection originates from
+   the same host, the server includes trailing metadata key `shm-ctl` whose
+   value is the control segment name.
+3. The client opens the control segment and proceeds with the
+   [Establishment Sequence](#establishment-sequence).
+
+If the server does not return `shm-ctl`, or if the client fails to open
+the control segment, the client continues using HTTP/2.
+
+`shm-offer` and `shm-ctl` are reserved metadata keys. Applications and
+interceptors MUST NOT modify them. The discovered control segment name
+applies to the lifetime of the HTTP/2 connection; the client SHOULD NOT
+repeat discovery on the same connection. Discovery affects subsequent RPCs
+on that connection, not the RPC carrying `shm-offer` itself.
+
+### Control Segment Naming
+
+The control segment name returned in `shm-ctl` SHOULD contain a
+cryptographically random component to prevent name-guessing attacks.
+Recommended format:
+
+```
+<server-id>_<uuid>_ctl
+```
+
+The server generates the name when it receives `shm-offer` and creates
+the control segment before returning the trailing metadata.
+
+### Same-Host Detection
+
+The server SHOULD verify that the client is on the same host before
+returning `shm-ctl`. The verification method is implementation-defined.
+
 ## Connection Establishment
 
 ### Control Segment
 
 Connection establishment uses a shared control segment. The control
-segment name is discovered through an out-of-band mechanism (e.g.
-configuration). The control segment uses the same binary layout as a data
+segment name is provided by the server during
+[Transport Discovery](#transport-discovery) or through an out-of-band
+mechanism. The control segment uses the same binary layout as a data
 segment; fields that are connection-specific (ClientPID, ClientReady)
 apply to the current exchange only and are reset between connections.
 
@@ -499,6 +543,53 @@ buffers:
 * H2's 3-byte Length field caps a single frame at 16 MB. A 4-byte field
   supports up to ~4 GB, which reduces fragmentation for large messages.
 
+## Security Considerations
+
+### Threat Model
+
+SHM transport runs on a single host. Its security model relies on OS
+process isolation, similar to Unix domain sockets. The protocol does not
+defend against a malicious process that already has permission to map the
+shared memory region.
+
+### Segment Names
+
+Control segment names SHOULD contain a cryptographically random component
+(see [Control Segment Naming](#control-segment-naming)). A predictable
+name allows a rogue process to pre-create a segment with the same name and
+intercept connections.
+
+### File Permissions
+
+The shared memory backing file SHOULD be readable and writable only by
+processes that need access. When server and client run as the same OS user,
+Linux file mode 0600 is sufficient. Cross-user deployments require broader
+permissions (e.g. a shared group), which increases the attack surface.
+
+### Data Confidentiality and Integrity
+
+Segment contents are neither encrypted nor signed. Any process with
+mapping permission can read and write arbitrary bytes. Deployments that
+require confidentiality SHOULD restrict access through OS file permissions
+rather than protocol-level encryption, which would negate the performance
+benefit of shared memory.
+
+### Process Identity
+
+The ServerPID and ClientPID fields in the segment header are informational
+and MUST NOT be used for authentication (PIDs may be recycled). Process
+authentication beyond PID is deferred to the security handshake extension
+(0x20–0x2F); see
+[Security Handshake Extension](#security-handshake-extension-0x200x2f).
+
+### Denial of Service
+
+A malicious client may hold the control-segment write lock indefinitely,
+preventing other clients from connecting. Implementations SHOULD apply a
+timeout when acquiring the lock. A malicious peer may also fill the ring
+without reading, causing the other side to block on writes; ring-level
+backpressure is inherent to the protocol.
+
 ## Implementation
 
 The protocol requires a platform that supports:
@@ -520,3 +611,7 @@ The protocol requires a platform that supports:
 * **Cross-container IPC.** Containers isolate IPC namespaces by default.
   Shared memory between containers requires either a shared IPC namespace or
   a volume pointing to the same backing file.
+
+* **Stale segment cleanup.** If a server process crashes, its shared memory
+  backing files and lock files may remain on disk. Cleanup of stale
+  segments is implementation-defined.
