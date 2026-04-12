@@ -393,10 +393,10 @@ All control frames use StreamID = 0.
 
 ### Control Frame Payloads
 
-#### CONNECT Payload (17 bytes)
+#### CONNECT Payload (18 bytes)
 
 ```
-Version(1B) | RingACapacity(8B LE) | RingBCapacity(8B LE)
+Version(1B) | RingACapacity(8B LE) | RingBCapacity(8B LE) | Flags(1B)
 ```
 
 - Version: control-frame encoding version (current = 1). This is
@@ -405,6 +405,14 @@ Version(1B) | RingACapacity(8B LE) | RingBCapacity(8B LE)
 - RingACapacity / RingBCapacity: client's preferred ring sizes in bytes.
   A value of 0 means "use the server's default." The server is free to
   choose smaller capacities.
+- Flags: bitfield for connection options. Defined bits:
+
+  | Bit | Name | Description |
+  |-----|------|-------------|
+  | 0 | SINGLE_STREAM | Client requests single-stream mode |
+  | 1–7 | (reserved) | MUST be 0 |
+
+  Receivers MUST ignore unknown flag bits for forward compatibility.
 
 #### ACCEPT Payload (variable)
 
