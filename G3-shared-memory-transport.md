@@ -337,6 +337,13 @@ metadata on any RPC:
 If the server does not return `shm-ctl`, or if the client fails to open
 the control segment, the client continues using HTTP/2.
 
+The negotiation is backward compatible. A server that does not
+implement this protocol ignores the unknown `shm-offer` key (per standard
+gRPC metadata handling) and never returns `shm-ctl`; the client stays on
+HTTP/2. A client that does not implement this protocol never sends
+`shm-offer`; the server does not push SHM. Either side may be upgraded
+independently without breaking existing deployments.
+
 `shm-offer` and `shm-ctl` are reserved metadata keys. Applications and
 interceptors MUST NOT modify them. The discovered control segment name
 applies to the lifetime of the HTTP/2 connection; the client SHOULD NOT
@@ -541,9 +548,17 @@ backpressure.
 We looked at reusing HTTP/2 framing (9-byte header + HPACK) over the ring
 buffers:
 
-* HPACK maintains per-connection encoder/decoder state and would still
-  require a separate HEADERS parsing path, so keeping the H2 frame header
-  alone does not let implementations share code with existing H2 stacks.
+* HPACK is a stateful codec: the receiver must decode HEADERS payloads
+  into an intermediate structure before it can read method, authority, or
+  custom metadata. This rules out reading metadata directly from ring
+  memory, the primary use case for this transport. The Headers V1 encoding used here is a flat
+  length-prefixed format that can be parsed in place from the ring.
+
+* Dropping HPACK but keeping the H2 frame header does not recover parser
+  reuse. Existing HTTP/2 stacks (Go, Java, C++, Rust) couple frame
+  parsing with socket I/O; none of them accept an arbitrary memory span
+  as input. An implementation would need to write a new frame reader
+  regardless of whether the header layout matches H2.
 
 * A 16-byte frame header aligns to power-of-2 offsets in the ring,
   avoiding reads that straddle cache lines. A 9-byte header does not.
