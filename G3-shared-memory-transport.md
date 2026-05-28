@@ -85,7 +85,9 @@ The segment header resides at offset 0 of the mapped region.
 | 0x44 | 4B | ClientReady | Client ready flag (0 or 1) |
 | 0x48 | 4B | Closed | Connection closed flag (0 or 1) |
 | 0x4C | 4B | Pad | Alignment padding |
-| 0x50–0x7F | 48B | Reserved | MUST be 0 |
+| 0x50 | 4B | MaxStreams | Maximum concurrent streams negotiated at segment creation (0 = unlimited; informational only — stream count is also enforced via [SETTINGS](#settings)) |
+| 0x54 | 4B | OpenerWakeReady | Set to 1 by the opener (client) before `ClientReady` if it established an eventfd-based ring waker, else 0. The creator (server) uses this to decide whether to keep its own eventfd waker or release it; ensures both sides converge on the same wake primitive (eventfd OR futex) to avoid a deadlock where the creator parks on eventfd `read` but the opener only `futex_wake`s |
+| 0x58–0x7F | 40B | Reserved | MUST be 0 |
 
 Implementations MUST validate Magic and Version after mapping. An
 unrecognized Magic or Version MUST cause the mapping to be discarded.
@@ -128,7 +130,7 @@ Each ring buffer has a 64-byte header at the byte offset given by
 | 0x2C | 4B | SpaceWaiters | Writers blocked waiting for space |
 | 0x30 | 4B | ContigWaiters | Writers blocked waiting for contiguity (optional) |
 | 0x34 | 4B | DataWaiters | Readers blocked waiting for data |
-| 0x38–0x3F | 8B | Reserved | MUST be 0 |
+| 0x38–0x3F | 8B | SpeculativeReserved | Bytes the reader has "committed" (`ReadIdx` advanced) but still references via zero-copy buffer slices into the ring. Writers subtract this from `Capacity - (WriteIdx - ReadIdx)` to avoid overwriting ring memory that the application on the reader side is still holding live. Updated atomically. Implementations that do not use zero-copy receive MUST leave this field 0 |
 
 ### Ring Data Area
 
@@ -254,15 +256,18 @@ The payload encodings for each Type are defined below.
 
 ### Control Frame Payloads
 
-#### CONNECT Payload (18 bytes)
+#### CONNECT Payload (20 bytes, v2)
 
 ```
 Version(1B) | RingACapacity(8B LE) | RingBCapacity(8B LE) | Flags(1B)
+            | WireFormatCount(1B) | WireFormat[0](1B)
 ```
 
-- Version: control-frame encoding version (current = 1). This is
-  independent of the segment header Version field, which describes the
-  segment binary layout.
+- Version: control-frame encoding version. **Current = 2.** v1 (a
+  shorter 18-byte payload without the WireFormat advertisement) is
+  legacy and MUST be rejected by v2 peers. Both grpc-go and grpc-dotnet
+  reference implementations have moved to v2; pre-1.0 wire breakage is
+  acceptable.
 - RingACapacity / RingBCapacity: client's preferred ring sizes in bytes.
   A value of 0 means "use the server's default." The server is free to
   choose smaller capacities.
@@ -278,22 +283,46 @@ Version(1B) | RingACapacity(8B LE) | RingBCapacity(8B LE) | Flags(1B)
 
   `SINGLE_STREAM` is a hint that the client will not open more than one
   concurrent stream. It does not appear on the wire after CONNECT; the
-  server signals acceptance by advertising
-  `SETTINGS_MAX_CONCURRENT_STREAMS = 1` in its initial SETTINGS frame on
-  the data segment. The hint allows the server to skip per-stream
-  scheduling state. Setting the bit does not change frame syntax: the
-  client MUST still emit valid HTTP/2 frames with non-zero StreamID for
-  RPCs.
+  server signals acceptance by echoing the `SINGLE_STREAM` bit in
+  ACCEPT Flags. The hint allows both sides to skip per-stream
+  scheduling state and take an inline-write fast path. Setting the bit
+  does not change frame syntax: the client MUST still emit valid
+  HTTP/2 frames with non-zero StreamID for RPCs.
 
-#### ACCEPT Payload (variable)
+- WireFormatCount: number of WireFormat bytes that follow. MUST be at
+  least 1 in v2 (the client MUST advertise at least one wire format).
+- WireFormat[i]: ordered list of wire formats the client supports.
+  Currently defined value:
+
+  | Value | Name |
+  |-------|------|
+  | 0x01 | HTTP/2 (mandatory; see [HTTP/2 Mapping](#http2-mapping)) |
+
+  A v2-conformant client MUST include `0x01` (HTTP/2) in its advertised
+  list. The server picks the first format from the client list that
+  the server supports; if no match, the server responds with REJECT.
+
+#### ACCEPT Payload (variable, v2)
 
 ```
-Version(1B) | NameLen(4B LE) | DataSegmentName(var, UTF-8)
+Version(1B) | NameLen(4B LE) | DataSegmentName(var, UTF-8) |
+            | SelectedWireFormat(1B) | Flags(1B)
 ```
 
-Contains the name of the data segment the server has allocated. After
-receiving ACCEPT, the client maps the named segment. The negotiated ring
-capacities are read from the data segment's header.
+Contains the name of the data segment the server has allocated, the
+chosen wire format, and an echoed Flags byte.
+
+- Version: MUST equal the Version sent in CONNECT (currently 2).
+- NameLen / DataSegmentName: name of the data segment to map.
+- SelectedWireFormat: the single wire format the server has selected
+  from the client's advertised list. Currently MUST be `0x01` (HTTP/2).
+- Flags: echoes the CONNECT Flags byte with server-side acknowledgment.
+  Bit 0 (`SINGLE_STREAM`) is set iff both sides agree to the single-
+  stream fast path; the server MAY clear bit 0 to decline a client's
+  request. Reserved bits MUST be 0.
+
+After receiving ACCEPT, the client maps the named segment. The
+negotiated ring capacities are read from the data segment's header.
 
 #### REJECT Payload (variable)
 
@@ -323,9 +352,11 @@ HTTP/2.
 5. Client reads the response and releases the write lock.
 6. Client maps the data segment and sets `ClientReady = 1` in the **data**
    segment header.
-7. HTTP/2 frames begin flowing on Ring A and Ring B of the data segment,
-   starting with each side's initial SETTINGS frame (see
-   [Connection Preface](#connection-preface)).
+7. HTTP/2 frames begin flowing on Ring A and Ring B of the data segment
+   under the v1 fixed default profile (see
+   [Connection Preface](#connection-preface) and
+   [SETTINGS](#settings)). No explicit SETTINGS exchange is required
+   on the data ring in v1.
 
 ### Security Handshake
 
@@ -367,7 +398,7 @@ writer-blocks-on-space and reader-blocks-on-data through the
 | HEADERS (0x1) | yes | Initial headers; trailers carry END_STREAM |
 | PRIORITY (0x2) | ignored | Stream prioritization is not used; receivers MUST silently ignore |
 | RST_STREAM (0x3) | yes | Stream cancellation |
-| SETTINGS (0x4) | yes | Negotiation; ACK MUST be sent per RFC 7540 |
+| SETTINGS (0x4) | optional (v1) | Default profile is implicit; if a peer DOES emit SETTINGS, the peer MUST also ACK any received SETTINGS per RFC 7540. v1 implementations SHOULD skip the exchange entirely to save the startup ring round-trip |
 | PUSH_PROMISE (0x5) | not used | gRPC does not use server push |
 | PING (0x6) | yes | Keepalive |
 | GOAWAY (0x7) | yes | Connection shutdown |
@@ -385,36 +416,62 @@ be used. The Connection Establishment handshake on the control segment has
 already established a peer relationship by the time the data segment is
 mapped.
 
-After [Establishment Sequence](#establishment-sequence) step 7, both peers
-MUST send a SETTINGS frame as the first HTTP/2 frame on their respective
-data-segment ring, and MUST acknowledge the peer's SETTINGS with a
-SETTINGS frame carrying the ACK flag.
+After [Establishment Sequence](#establishment-sequence) step 7, both
+peers begin emitting HTTP/2 frames on their respective data-segment
+rings. v1 of this gRFC defines a **fixed-profile** transport: both
+peers MUST behave as if the [default SETTINGS values listed below](#settings)
+have already been negotiated, WITHOUT exchanging an explicit SETTINGS
+frame on the data ring.
+
+Implementations MAY emit an initial SETTINGS frame and its ACK for
+diagnostic clarity (e.g. when interoperating with a generic HTTP/2
+debugger), but a strict v1 implementation SHOULD skip the exchange to
+save the per-frame ring round-trip on connection startup. Either way,
+peers MUST treat any received SETTINGS as advisory: the **default
+profile takes precedence** over any sender-advertised values that
+deviate from the defaults, except where explicitly noted below
+(MAX_CONCURRENT_STREAMS, INITIAL_WINDOW_SIZE, MAX_FRAME_SIZE may be
+clamped DOWN from defaults by either side).
+
+A future revision of this gRFC MAY make SETTINGS exchange mandatory
+(and define new parameters) once a non-default profile is needed; the
+control-frame `Version` byte (currently 2) is the gate.
 
 ### SETTINGS
 
-The following parameters apply to this transport. The defaults below
-apply to parameters not explicitly advertised:
+The following parameters define the v1 default profile. Implementations
+that do not exchange SETTINGS use these values implicitly; an
+implementation that DOES exchange SETTINGS MUST advertise values
+compatible with the table below (downscaling permitted only where
+noted).
 
 | Parameter | Default | Purpose |
 |-----------|---------|---------|
-| HEADER_TABLE_SIZE (0x1) | 0 | Disable HPACK dynamic table; MUST be 0 (see [HPACK](#hpack)) |
-| ENABLE_PUSH (0x2) | 0 | Server push is not used; MUST be 0 |
-| MAX_CONCURRENT_STREAMS (0x3) | unlimited | Server-defined; clients MUST honor when advertised |
-| INITIAL_WINDOW_SIZE (0x4) | 2,147,483,647 (2³¹ − 1) | See [Flow Control](#flow-control) |
+| HEADER_TABLE_SIZE (0x1) | 4096 | HPACK dynamic table size (matches RFC 7541 default; see [HPACK](#hpack)). v1 of this gRFC permits the dynamic table; receivers MUST handle indexed references per RFC 7541 |
+| ENABLE_PUSH (0x2) | 0 | Server push is not used; MUST remain 0 |
+| MAX_CONCURRENT_STREAMS (0x3) | unlimited | Either side MAY clamp downward (e.g. via the segment header `MaxStreams` field at construction time). The clamped value is enforced by both sides |
+| INITIAL_WINDOW_SIZE (0x4) | 33,554,432 (32 MiB) | The default tuned for shared-memory bandwidth. Implementations SHOULD use 32 MiB unless the deployment explicitly opts into a smaller window (e.g. for fairness testing against socket transports). The HTTP/2 absolute maximum of 2,147,483,647 (2³¹ − 1) MAY be selected |
 | MAX_FRAME_SIZE (0x5) | 16,777,215 (2²⁴ − 1) | Maximum permitted by RFC 7540 |
 | MAX_HEADER_LIST_SIZE (0x6) | 1,048,576 (1 MiB) | Bound on header list size |
 
-For parameters other than HEADER_TABLE_SIZE and ENABLE_PUSH, a peer MAY
-advertise smaller values. Senders MUST honor the peer's advertised
-values per RFC 7540 §6.5.
+For parameters other than `ENABLE_PUSH`, a peer MAY advertise smaller
+values when a SETTINGS exchange is performed. Senders MUST honor the
+peer's advertised values per RFC 7540 §6.5.
 
 ### HPACK
 
-Senders MUST NOT add entries to a dynamic table; receivers MUST NOT use
-dynamic-table state. With `HEADER_TABLE_SIZE = 0` advertised, a receiver
-MUST treat any reference to an index above the static table size (61,
-defined in RFC 7541 Appendix A) as a connection error of type
-COMPRESSION_ERROR.
+v1 of this gRFC permits HPACK dynamic table use with the standard RFC
+7541 default of 4096 bytes; receivers MUST handle indexed references
+including dynamic-table inserts and references above the static table
+size (61, defined in RFC 7541 Appendix A).
+
+A future revision MAY tighten this to `HEADER_TABLE_SIZE = 0` if
+required by a particular deployment profile (e.g. for security audits
+that prefer zero shared decoder state across processes). The grpc-go
+and grpc-dotnet reference implementations both use the RFC 7541 default
+dynamic table size; in the shared-memory benchmark suite the dynamic
+table contributes a measurable saving on repeated metadata headers
+that justifies the small per-frame parse cost.
 
 Senders MAY use Huffman encoding for string literals. Receivers MUST
 support Huffman decoding.
@@ -460,26 +517,34 @@ including the handling of frames received on closed streams.
 ### Flow Control
 
 Stream-level flow control follows the HTTP/2 WINDOW_UPDATE model
-(RFC 7540 §6.9) with `INITIAL_WINDOW_SIZE = 2³¹ − 1`. WINDOW_UPDATE
-frames are read and processed per the spec; with the maximum initial
-window, back-pressure is provided by the shared memory ring (writer
-blocks when the ring is full, reader blocks when it is empty, signaled
-via the wait/wake primitives in [Wait/Wake](#waitwake)).
+(RFC 7540 §6.9) with the default `INITIAL_WINDOW_SIZE = 33,554,432`
+(32 MiB) from the v1 [SETTINGS profile](#settings). WINDOW_UPDATE
+frames are read and processed per the spec; the multi-MiB stream
+window combined with the receive-side multi-anchor zero-copy path
+moves the dominant back-pressure source to the shared memory ring
+occupancy itself (writer blocks when the ring is full, reader blocks
+when it is empty, signaled via the wait/wake primitives in
+[Wait/Wake](#waitwake)).
 
 The HTTP/2 connection-level flow-control window starts at 65,535
 (RFC 7540 §6.9.2) and is not affected by `SETTINGS_INITIAL_WINDOW_SIZE`.
-To prevent the connection window from constraining throughput,
-immediately after sending its initial SETTINGS frame each peer MUST
-send a WINDOW_UPDATE frame with stream identifier 0 and an increment of
-`2,147,418,112` (`2³¹ − 1 − 65535`), raising the connection-level
-window to `2³¹ − 1`.
+To prevent the connection window from constraining throughput, each
+peer MUST send an initial conn-level `WINDOW_UPDATE` frame (stream
+identifier 0) raising the connection window to at least the value of
+the v1 default `INITIAL_WINDOW_SIZE` (32 MiB), as the FIRST outbound
+frame on its data-segment ring. Implementations MAY raise it further,
+up to the HTTP/2 maximum of `2,147,483,647` (`2³¹ − 1`).
+
+When a peer opts into a smaller stream window (e.g. for fairness
+testing against socket transports), the initial conn-level WU MUST
+still be at least that smaller stream-window value.
 
 Both connection-level and stream-level windows decrement as DATA frames
 are sent. Receivers SHOULD send WINDOW_UPDATE frames as bytes are
 consumed so that neither window becomes the limiting back-pressure
 mechanism; in the steady state, back-pressure is provided by ring
 occupancy via [Wait/Wake](#waitwake), not by HTTP/2 windows.
-Implementations MAY keep both windows near `2³¹ − 1`. WINDOW_UPDATE
+Implementations MAY keep both windows at the default. WINDOW_UPDATE
 frames are processed per RFC 7540.
 
 ## Synchronization
